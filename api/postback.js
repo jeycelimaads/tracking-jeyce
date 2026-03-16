@@ -1,25 +1,30 @@
-const nodemailer = require('nodemailer');
-const { google } = require('googleapis');
+import { google } from 'googleapis';
 
 export default async function handler(req, res) {
-  const { status, platform, payout, product, order, subid1, subid2, subid3 } = req.query;
+  const { status, platform, payout, commission, value, product, subid1, subid2, subid3 } = req.query;
 
-  const statusSucesso = ['approved', 'complete', 'confirmed', 'sale', 'success'];
+  // 1. Verificação de Status
+  const statusSucesso = ['approved', 'complete', 'confirmed', 'sale', 'success', 'payout', 'ordered'];
   if (status && !statusSucesso.includes(status.toLowerCase())) {
     return res.status(200).send(`Status ${status} ignorado.`);
   }
+
+  // 2. Ajuste do Valor da Comissão (Transforma 44.00 em 44)
+  let valorRaw = payout || commission || value || "0";
+  let valorLimpo = valorRaw.toString().replace(/\s/g, '').replace(',', '.');
+  let valorNumerico = parseFloat(valorLimpo) || 0;
+  
+  // Math.floor remove os centavos sem dividir o valor. Ex: 44.90 vira 44.
+  const valorComissaoFinal = Math.floor(valorNumerico).toString();
 
   const agora = new Date();
   const brasiliaTime = new Date(agora.getTime() - (3 * 60 * 60 * 1000));
   const dataFormatada = brasiliaTime.toISOString().replace('T', ' ').split('.')[0] + "-0300";
   
-  // --- AJUSTE NO VALOR DA COMISSÃO (REMOVE O .00) ---
-  const valorBruto = payout ? parseFloat(payout) : 0;
-  const valorComissao = Math.floor(valorBruto).toString(); 
-  
-  const nomeProduto = product || "N/A";
+  // Prioridade para capturar o nome do produto
+  const nomeProduto = product || subid1 || "Produto N/A";
 
-  // --- TENTATIVA DE SALVAR NA PLANILHA ---
+  // 3. Salvar na Planilha Google
   let planilhaStatus = "Não configurada";
   try {
     if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY && process.env.GOOGLE_SHEET_ID) {
@@ -29,14 +34,13 @@ export default async function handler(req, res) {
       });
       const sheets = google.sheets({ version: 'v4', auth });
       
-      // AQUI ENTRA A PARTE QUE VOCÊ PERGUNTOU:
       const values = [[
-        subid2 || 'N/A',      // Subid2
-        'Compra',             // Conversion
-        dataFormatada,        // Conversion Time
-        valorComissao,        // Valor sem o .00
-        'USD',                // Conversion Currency
-        nomeProduto           // Produto
+        subid2 || 'N/A',      // Coluna A: Gclid
+        'Compra',             // Coluna B: Conversion
+        dataFormatada,        // Coluna C: Time
+        valorComissaoFinal,   // Coluna D: Conversion Value (Agora envia 44)
+        'USD',                // Coluna E: Currency
+        nomeProduto           // Coluna F: Nome do Produto
       ]];
 
       await sheets.spreadsheets.values.append({
@@ -53,35 +57,27 @@ export default async function handler(req, res) {
     planilhaStatus = "Erro: " + error.message;
   }
 
-  // --- NOTIFICAÇÕES ---
-  const reportHTML = `<b>Nova venda na ${platform || 'MediaScalers'}! $${valorComissao} USD</b>\n\n` +
-                     `produto: ${nomeProduto}\n` +
-                     `pedido: ${order || 'N/A'}\n\n` +
-                     `data: ${dataFormatada}\n\n` +
-                     `subid2 (Gclid): ${subid2 || 'N/A'}\n` +
-                     `subid3 (Campanha): ${subid3 || 'N/A'}`;
+  // 4. Notificação Telegram
+  const reportHTML = `<b>Nova venda na ${platform || 'Plataforma'}!</b>\n\n` +
+                     `<b>Comissão:</b> $ ${valorComissaoFinal} USD\n` +
+                     `<b>Produto:</b> ${nomeProduto}\n` +
+                     `<b>Data:</b> ${dataFormatada}\n\n` +
+                     `<b>Gclid:</b> <code>${subid2 || 'N/A'}</code>\n` +
+                     `<b>Campanha:</b> ${subid3 || 'N/A'}`;
 
   try {
     await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text: reportHTML, parse_mode: 'HTML' })
+      body: JSON.stringify({ 
+        chat_id: process.env.TELEGRAM_CHAT_ID, 
+        text: reportHTML, 
+        parse_mode: 'HTML' 
+      })
     });
 
-    let transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-    });
-
-    await transporter.sendMail({
-      from: `"Tracking Jeyce" <${process.env.EMAIL_USER}>`,
-      to: process.env.EMAIL_USER,
-      subject: `Venda Confirmada: ${nomeProduto} ($${valorComissao})`,
-      text: reportHTML.replace(/<[^>]*>/g, '')
-    });
-
-    res.status(200).json({ status: "OK", planilha: planilhaStatus });
+    res.status(200).json({ status: "OK", valor: valorComissaoFinal, produto: nomeProduto });
   } catch (error) {
-    res.status(500).json({ status: "Erro nas notificações", erro: error.message });
+    res.status(200).json({ status: "Erro", erro: error.message });
   }
 }
